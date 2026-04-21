@@ -329,10 +329,10 @@ export default function Dashboard() {
                   labelStyle={{ color: '#94a3b8', marginBottom: 4 }}
                   labelFormatter={(label: any) => formatDate(String(label))}
 
-                  formatter={(value: number, name: string) => [
-                    metric === 'nav_price' ? value.toFixed(4) : `${value.toFixed(2)}%`,
-                    name
-                  ]}
+                  formatter={(value: any, name: any) => [
+  value != null ? (metric === 'nav_price' ? Number(value).toFixed(4) : `${Number(value).toFixed(2)}%`) : '—',
+  name
+]}
                 />
                 <Legend
                   wrapperStyle={{ fontSize: '12px', paddingTop: '16px' }}
