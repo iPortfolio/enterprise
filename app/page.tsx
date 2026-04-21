@@ -327,7 +327,8 @@ export default function Dashboard() {
                     fontSize: '12px',
                   }}
                   labelStyle={{ color: '#94a3b8', marginBottom: 4 }}
-                  labelFormatter={formatDate}
+                  labelFormatter={(label: any) => formatDate(String(label))}
+
                   formatter={(value: number, name: string) => [
                     metric === 'nav_price' ? value.toFixed(4) : `${value.toFixed(2)}%`,
                     name
