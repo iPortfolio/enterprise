@@ -75,6 +75,28 @@ const HEAT_LABELS: Record<HeatMetric, string> = {
 const HEAT_HIGHER_BETTER: Record<HeatMetric, boolean> = {
   score: true, totalReturn: true, stdDev: false, sharpe: true, alpha: true, beta: false
 }
+const HEAT_METRIC_TOOLTIPS: Record<HeatMetric, string> = {
+  score: 'Összesített pontszám 0–100: súlyozva mutatja, melyik alap teljesített jobban kockázat-hozam szempontból. Sharpe 35%, Alfa 30%, Béta 20%, Szórás 15%.',
+  totalReturn: 'Negyedéves hozam: az adott negyedév első és utolsó napja közötti árfolyamváltozás %-ban.',
+  stdDev: 'Évesített szórás: az árfolyam-ingadozás mértéke az adott negyedévben. Alacsonyabb = stabilabb alap.',
+  sharpe: 'Sharpe-ráta: a kockázatmentes hozam (6%) feletti részt osztja a szórással. Minél magasabb, annál hatékonyabban kompenzálja a kockázatot.',
+  alpha: 'Alfa: az alap hozama a benchmark mozgásán felül. Pozitív alfa = az alapkezelő értéket termelt a piaci mozgáson túl.',
+  beta: 'Béta: piaci érzékenység a benchmarkhoz képest. <1 = kisebb kilengés mint a piac; >1 = felerősített mozgás.',
+}
+const YEARLY_METRIC_EXPLAIN: Record<string, string> = {
+  sharpe: 'Sharpe-ráta: egységnyi kockázatra jutó éves hozam a kockázatmentes hozam (6%) felett. 1 felett kiváló, 0–1 között elfogadható, negatív esetén az alap nem kompenzálta a vállalt kockázatot.',
+  sortino: 'Sortino-ráta: hasonló a Sharpe-hoz, de csak a negatív hozamokat bünteti. Megmutatja, mennyit keres az alap a hátrányos kockázathoz képest. Magasabb = jobb.',
+  maxDD: 'Maximális visszaesés (Max Drawdown): az éves csúcstól a mélypontig tartó legnagyobb esés %-ban. Jelzi, mekkora veszteséget kellett elviselni a legsötétebb pillanatban.',
+  ddDays: 'Drawdown időtartama: hány napig tartott a visszaesés az éves csúcstól a mélypontig. Rövidebb = gyorsabb beavatkozás vagy meredekebb esés.',
+  recoveryDays: 'Helyreállási idő: hány napba telt a mélypont után visszaérni a korábbi csúcsra. Ha nincs adat, az alap még nem ért vissza a csúcsra az adott időszakban.',
+  beta: 'Béta: az alap érzékenysége a benchmark mozgásaira az adott naptári évben mérve. Béta=1: azonos mozgás; <1: kisebb kilengés; >1: felerősített mozgás.',
+}
+const YEARLY_SUBROW_EXPLAIN: Record<string, string> = {
+  'Átlag': 'Az összes naptári évben mért értékek egyszerű átlaga.',
+  'Legjobb': 'A legjobb naptári év és értéke — zárójelben az évszám.',
+  'Legrosszabb': 'A legrosszabb naptári év és értéke — zárójelben az évszám.',
+  'Szórás (σ)': 'Az éves értékek szórása: mennyire ingadozik a mutató évről évre. Kisebb szórás = konzisztensebb teljesítmény.',
+}
 const ROLLING_DAYS: Record<MainMetric, number> = {
   pct: 0, return_1y: 365, return_3y: 1095, return_5y: 1825
 }
@@ -142,6 +164,14 @@ function cellBg(direction: 'good' | 'bad' | 'neutral', intensity: number): strin
   if (direction === 'good') return `rgba(16,185,129,${a})`
   if (direction === 'bad') return `rgba(239,68,68,${a})`
   return 'transparent'
+}
+
+function winnerBg(val: number|null, vals: (number|null)[], higherBetter: boolean): string {
+  if (val == null) return ''
+  const nums = vals.filter((v): v is number => v != null)
+  if (nums.length < 2) return ''
+  const best = higherBetter ? Math.max(...nums) : Math.min(...nums)
+  return val === best ? 'bg-emerald-900/60' : ''
 }
 
 function heatStyleScore(val: number, rowMetrics: PeriodSeriesMetrics[]): string {
@@ -424,10 +454,15 @@ function ScoreBar({score,color}:{score:number|null;color:string}) {
 function ExplainRow({label,explanation,children}:{label:string;explanation:string;children:React.ReactNode}) {
   const [show,setShow]=useState(false)
   return (
-    <tr className="relative transition-colors hover:bg-slate-800/40" onMouseEnter={()=>setShow(true)} onMouseLeave={()=>setShow(false)}>
-      <td className="py-3 pr-6 text-slate-400 font-medium whitespace-nowrap w-44">
-        <span className="border-b border-dotted border-slate-600 cursor-help">{label}</span>
-        {show&&<div className="absolute left-0 top-full z-50 mt-1 w-80 bg-slate-800 border border-slate-600 rounded-lg p-3 text-xs text-slate-300 leading-relaxed shadow-xl pointer-events-none">{explanation}</div>}
+    <tr className="transition-colors hover:bg-slate-800/30">
+      <td className="py-3 pr-3 text-slate-400 font-medium whitespace-nowrap w-36">
+        <span className="flex items-center gap-1.5">
+          <span>{label}</span>
+          <span className="relative shrink-0" onMouseEnter={()=>setShow(true)} onMouseLeave={()=>setShow(false)}>
+            <span className="inline-flex items-center justify-center w-4 h-4 rounded-full bg-slate-800 text-slate-500 hover:text-slate-300 hover:bg-slate-700 text-[10px] cursor-help transition-colors select-none">i</span>
+            {show&&<div className="absolute left-0 top-full z-50 mt-1 w-64 whitespace-normal bg-slate-800 border border-slate-600 rounded-lg p-3 text-xs text-slate-300 leading-relaxed shadow-xl pointer-events-none">{explanation}</div>}
+          </span>
+        </span>
       </td>
       {children}
     </tr>
@@ -441,6 +476,72 @@ function InfoPanel({text}:{text:string}) {
       {open&&<div className="absolute left-0 top-7 z-50 mt-1 p-3 bg-slate-800 border border-slate-700 rounded-lg text-xs text-slate-300 leading-relaxed w-80 shadow-xl">{text}</div>}
     </span>
   )
+}
+function HoverTooltip({text,children,up}:{text:string;children:React.ReactNode;up?:boolean}) {
+  const [show,setShow]=useState(false)
+  return (
+    <span className="relative inline-block cursor-help" onMouseEnter={()=>setShow(true)} onMouseLeave={()=>setShow(false)}>
+      {children}
+      {show&&<div className={`absolute left-0 z-50 w-64 whitespace-normal bg-slate-800 border border-slate-600 rounded-lg p-3 text-xs text-slate-300 leading-relaxed shadow-xl pointer-events-none ${up?'bottom-full mb-1':'top-full mt-1'}`}>{text}</div>}
+    </span>
+  )
+}
+
+// ── Állapotkód ────────────────────────────────────────────────────────────────
+
+const PERIOD_CHAR:Record<Period,string>={'1y':'1','3y':'3','5y':'5','all':'a'}
+const CHAR_PERIOD:Record<string,Period>={'1':'1y','3':'3y','5':'5y','a':'all'}
+const MODE_CHAR:Record<DateRangeMode,string>={'full':'f','common':'c'}
+const CHAR_MODE:Record<string,DateRangeMode>={'f':'full','c':'common'}
+const METRIC_CHAR:Record<MainMetric,string>={'pct':'p','return_1y':'y','return_3y':'r','return_5y':'e'}
+const CHAR_METRIC:Record<string,MainMetric>={'p':'pct','y':'return_1y','r':'return_3y','e':'return_5y'}
+
+function uuidToCode(uuid:string):string{
+  const hex=uuid.replace(/-/g,'')
+  let n=BigInt(0);const B16=BigInt(16)
+  for(const c of hex)n=n*B16+BigInt(parseInt(c,16))
+  return n.toString(36).padStart(26,'0')
+}
+function codeToUuid(s:string):string{
+  let n=BigInt(0);const B36=BigInt(36)
+  for(const c of s)n=n*B36+BigInt(parseInt(c,36))
+  const hex=n.toString(16).padStart(32,'0')
+  return `${hex.slice(0,8)}-${hex.slice(8,12)}-${hex.slice(12,16)}-${hex.slice(16,20)}-${hex.slice(20)}`
+}
+function encodeStateCode(period:Period,dateRangeMode:DateRangeMode,metric:MainMetric,showWinner:boolean,selectedIds:string[],selectedBmIds:string[],correctionMap:Record<string,string>):string{
+  const s=PERIOD_CHAR[period]+MODE_CHAR[dateRangeMode]+METRIC_CHAR[metric]+(showWinner?'1':'0')
+  const f=selectedIds.map(uuidToCode).join('')
+  const b=selectedBmIds.map(uuidToCode).join('')
+  const c=Object.entries(correctionMap).filter(([,v])=>v).map(([k,v])=>uuidToCode(k)+uuidToCode(v)).join('')
+  return `ae.${s}.${f}.${b}.${c}`
+}
+function decodeStateCode(code:string,allFunds:Fund[]):{period:Period;dateRangeMode:DateRangeMode;metric:MainMetric;showWinner:boolean;selectedIds:string[];selectedBmIds:string[];correctionMap:Record<string,string>;correctionSources:string[]}|null{
+  try{
+    const parts=code.trim().split('.')
+    if(parts.length!==5||parts[0]!=='ae') return null
+    const st=parts[1]
+    if(st.length!==4) return null
+    const period=CHAR_PERIOD[st[0]],dateRangeMode=CHAR_MODE[st[1]],metric=CHAR_METRIC[st[2]]
+    if(!period||!dateRangeMode||!metric) return null
+    const showWinner=st[3]==='1'
+    const fundIds=new Set(allFunds.map(f=>f.id))
+    const parseUuids=(sec:string)=>{
+      if(!sec.length||sec.length%26!==0) return []
+      const out:string[]=[]
+      for(let i=0;i<sec.length;i+=26){const id=codeToUuid(sec.slice(i,i+26));if(fundIds.has(id))out.push(id)}
+      return out
+    }
+    const selectedIds=parseUuids(parts[2]),selectedBmIds=parseUuids(parts[3])
+    const correctionMap:Record<string,string>={}
+    if(parts[4].length>0&&parts[4].length%52===0){
+      for(let i=0;i<parts[4].length;i+=52){
+        const fId=codeToUuid(parts[4].slice(i,i+26)),cId=codeToUuid(parts[4].slice(i+26,i+52))
+        if(fundIds.has(fId)&&fundIds.has(cId))correctionMap[fId]=cId
+      }
+    }
+    const correctionSources=[...new Set(Object.values(correctionMap))]
+    return{period,dateRangeMode,metric,showWinner,selectedIds,selectedBmIds,correctionMap,correctionSources}
+  }catch{return null}
 }
 
 // ── Mini grafikon ─────────────────────────────────────────────────────────────
@@ -472,8 +573,9 @@ function MiniChart({allSeries,start,end}:{allSeries:DataSeries[];start:string;en
 
 // ── Periódus részletek ────────────────────────────────────────────────────────
 
-function PeriodDetail({period,allSeries}:{period:DrawPeriod;allSeries:DataSeries[]}) {
+function PeriodDetail({period,allSeries,showWinner}:{period:DrawPeriod;allSeries:DataSeries[];showWinner:boolean}) {
   const metrics=useMemo(()=>computeAllMetrics(allSeries,period.start,period.end),[period,allSeries])
+  const METRIC_HB:{[k:string]:boolean}={totalReturn:true,stdDev:false,sharpe:true,alpha:true,beta:false}
   const rows:[{key:keyof Omit<PeriodSeriesMetrics,'seriesId'|'seriesName'|'seriesColor'|'isBenchmark'|'indScores'|'totalScore'>,label:string,expl:string,fmt:(v:number|null)=>string}]=[
     {key:'totalReturn',label:'Teljes hozam',expl:EXPLAIN.totalReturn,fmt:fmtPct},
     {key:'stdDev',label:'Szórás (ann.)',expl:EXPLAIN.stdDev,fmt:fmtPct},
@@ -513,23 +615,30 @@ function PeriodDetail({period,allSeries}:{period:DrawPeriod;allSeries:DataSeries
             </tr>
           </thead>
           <tbody className="divide-y divide-slate-800/50">
-            {rows.map((row:any)=>(
-              <tr key={row.key} className="hover:bg-slate-800/30" title={row.expl}>
-                <td className="py-2 pr-4 text-slate-400"><span className="border-b border-dotted border-slate-700">{row.label}</span></td>
+            {rows.map((row:any)=>{
+              const rowVals=metrics.map((m:PeriodSeriesMetrics)=>{
+                const isBmAB=m.isBenchmark&&(row.key==='alpha'||row.key==='beta')
+                return isBmAB?null:m[row.key as keyof PeriodSeriesMetrics] as number|null
+              })
+              return (
+              <tr key={row.key} className="hover:bg-slate-800/30">
+                <td className="py-2 pr-4 text-slate-400">{row.label}</td>
                 {metrics.map((m:PeriodSeriesMetrics)=>{
                   const isBmAB=m.isBenchmark&&(row.key==='alpha'||row.key==='beta')
                   const val=m[row.key as keyof PeriodSeriesMetrics] as number|null
                   const sc=m.indScores[row.key as keyof MetricScores]
                   const vc=isBmAB||val==null?'text-slate-600':(row.key==='stdDev'||row.key==='beta')?(Number(val)<(row.key==='beta'?1:15)?'text-emerald-400':Number(val)<(row.key==='beta'?1.3:25)?'text-yellow-400':'text-red-400'):Number(val)>=0?'text-emerald-400':'text-red-400'
+                  const wBg=showWinner&&!isBmAB?winnerBg(val,rowVals,METRIC_HB[row.key]):''
                   return (
                     <React.Fragment key={`${m.seriesId}-${row.key}`}>
-                      <td className={`py-2 px-2 text-right font-mono font-medium ${vc}`}>{isBmAB?'—':row.fmt(val)}</td>
+                      <td className={`py-2 px-2 text-right font-mono font-medium ${vc} ${wBg}`}>{isBmAB?'—':row.fmt(val)}</td>
                       <td className="py-2 px-2 text-center">{isBmAB?<span className="text-slate-700">—</span>:<ScoreBadge score={sc}/>}</td>
                     </React.Fragment>
                   )
                 })}
               </tr>
-            ))}
+              )
+            })}
             <tr className="border-t-2 border-slate-600 bg-slate-800/20">
               <td className="py-3 pr-4 text-slate-300 font-semibold">Összesített score</td>
               {metrics.map((m:PeriodSeriesMetrics)=>(
@@ -549,7 +658,7 @@ function PeriodDetail({period,allSeries}:{period:DrawPeriod;allSeries:DataSeries
 
 // ── Összefoglaló tábla ────────────────────────────────────────────────────────
 
-function SummaryTable({allPeriods,allSeries}:{allPeriods:DrawPeriod[];allSeries:DataSeries[]}) {
+function SummaryTable({allPeriods,allSeries,showWinner}:{allPeriods:DrawPeriod[];allSeries:DataSeries[];showWinner:boolean}) {
   const summary=useMemo(()=>{
     const byId:Record<string,{scores:number[];series:DataSeries}>={}
     allSeries.forEach(s=>{byId[s.id]={scores:[],series:s}})
@@ -564,7 +673,7 @@ function SummaryTable({allPeriods,allSeries}:{allPeriods:DrawPeriod[];allSeries:
       <p className="text-xs text-slate-500 mb-5">Átlagos score az összes drawdown és drawup időszak alapján, sorrendbe rendezve.</p>
       <div className="space-y-4">
         {summary.map((item,rank)=>(
-          <div key={item.series.id} className="flex items-center gap-4">
+          <div key={item.series.id} className={`flex items-center gap-4 rounded-lg px-2 py-1 -mx-2 transition-colors ${showWinner&&rank===0&&item.avg!=null?'bg-emerald-900/30':''}`}>
             <div className="w-4 text-slate-600 font-mono text-sm shrink-0">{rank+1}.</div>
             <div className="w-48 text-sm font-medium truncate shrink-0" style={{color:item.series.color}}>{item.series.shortName}</div>
             <div className="flex-1"><ScoreBar score={item.avg} color={item.series.color}/></div>
@@ -637,8 +746,17 @@ function QuarterlyHeatmap({allSeries,effectiveStart,effectiveEnd}:{allSeries:Dat
     const val=heatMetric==='score'?m.totalScore:m[heatMetric as keyof PeriodSeriesMetrics] as number|null
     if(val==null) return 'transparent'
     const higher=HEAT_HIGHER_BETTER[heatMetric]
-    let direction:'good'|'bad'='bad', intensity=0
 
+    if(colorMode==='absolute'){
+      const candidates=rowMetrics.filter(x=>!x.isBenchmark).map(x=>({id:x.seriesId,v:(heatMetric==='score'?x.totalScore:x[heatMetric as keyof PeriodSeriesMetrics]) as number|null})).filter((x):x is {id:string,v:number}=>x.v!=null)
+      if(!candidates.length) return 'transparent'
+      const sorted=[...candidates].sort((a,b)=>higher?b.v-a.v:a.v-b.v)
+      if(sorted[0].id===m.seriesId) return cellBg('good',0.72)
+      if(candidates.length>=2&&sorted[sorted.length-1].id===m.seriesId) return cellBg('bad',0.72)
+      return 'transparent'
+    }
+
+    let direction:'good'|'bad'='bad', intensity=0
     if(colorCtx.mode==='score'){
       const vals=rowMetrics.filter(x=>!x.isBenchmark).map(x=>x.totalScore).filter((v):v is number=>v!=null)
       if(vals.length<2) return 'transparent'
@@ -658,8 +776,7 @@ function QuarterlyHeatmap({allSeries,effectiveStart,effectiveEnd}:{allSeries:Dat
       const raw=(norm-0.5)*2
       direction=raw>0?'good':'bad'; intensity=Math.abs(raw)
     }
-
-    return cellBg(direction, colorMode==='absolute'?0.72:intensity)
+    return cellBg(direction,intensity)
   }
 
   function fmtCell(m:PeriodSeriesMetrics):string{
@@ -706,7 +823,10 @@ function QuarterlyHeatmap({allSeries,effectiveStart,effectiveEnd}:{allSeries:Dat
         <div className="flex items-center gap-2 flex-wrap">
           <div className="flex bg-slate-800 rounded-lg p-0.5 gap-0.5">
             {(Object.keys(HEAT_LABELS) as HeatMetric[]).map(k=>(
-              <button key={k} onClick={()=>setHeatMetric(k)} className={`px-3 py-1.5 rounded-md text-xs font-medium transition-all ${heatMetric===k?'bg-slate-600 text-white':'text-slate-400 hover:text-slate-200'}`}>{HEAT_LABELS[k]}</button>
+              <div key={k} className="relative group">
+                <button onClick={()=>setHeatMetric(k)} className={`px-3 py-1.5 rounded-md text-xs font-medium transition-all ${heatMetric===k?'bg-slate-600 text-white':'text-slate-400 hover:text-slate-200'}`}>{HEAT_LABELS[k]}</button>
+                <div className="hidden group-hover:block absolute bottom-full left-0 z-50 mb-1 w-60 whitespace-normal bg-slate-800 border border-slate-600 rounded-lg p-2.5 text-xs text-slate-300 leading-relaxed shadow-xl pointer-events-none">{HEAT_METRIC_TOOLTIPS[k]}</div>
+              </div>
             ))}
           </div>
           <div className="flex bg-slate-800 rounded-lg p-0.5 gap-0.5">
@@ -738,6 +858,11 @@ function QuarterlyHeatmap({allSeries,effectiveStart,effectiveEnd}:{allSeries:Dat
           <tbody>
             {data.map((q,qi)=>{
               const qc=qChanges[qi]
+              // Absolute mode: per-row winner/loser for Δ% columns
+              const nonBmQPairs=allSeries.map((s,i)=>s.isBenchmark||qc.changes[i]==null?null:{i,v:qc.changes[i]!}).filter((x):x is {i:number,v:number}=>x!==null)
+              const qSorted=[...nonBmQPairs].sort((a,b)=>b.v-a.v)
+              const qAbsWinI=qSorted[0]?.i??-1
+              const qAbsLosI=nonBmQPairs.length>=2?qSorted[qSorted.length-1].i:-1
               return (
               <tr key={q.quarter}>
                 <td className="py-1.5 px-3 text-slate-500 font-mono whitespace-nowrap border border-slate-700 text-xs">{q.quarter}</td>
@@ -754,7 +879,10 @@ function QuarterlyHeatmap({allSeries,effectiveStart,effectiveEnd}:{allSeries:Dat
                 {/* Quarterly change columns */}
                 {allSeries.map((s,i)=>{
                   const val=qc.changes[i]
-                  const bg=s.isBenchmark?'transparent':getQChangeBg(val)
+                  let bg:string
+                  if(s.isBenchmark) bg='transparent'
+                  else if(colorMode==='absolute') bg=i===qAbsWinI?cellBg('good',0.72):i===qAbsLosI?cellBg('bad',0.72):'transparent'
+                  else bg=getQChangeBg(val)
                   return (
                     <td key={`c-${s.id}`} className={`${CELL} ${i===0?LBORDER:''}`} style={{backgroundColor:bg}}>
                       <span className={s.isBenchmark?'text-slate-400':'text-slate-100'}>{val==null?'—':fmtPct(val,2)}</span>
@@ -762,7 +890,8 @@ function QuarterlyHeatmap({allSeries,effectiveStart,effectiveEnd}:{allSeries:Dat
                   )
                 })}
               </tr>
-            )})}
+              )
+            })}
           </tbody>
         </table>
       </div>
@@ -772,7 +901,7 @@ function QuarterlyHeatmap({allSeries,effectiveStart,effectiveEnd}:{allSeries:Dat
 
 // ── Éves kockázati tábla ─────────────────────────────────────────────────────
 
-function YearlyRiskTable({allSeries,effectiveStart,effectiveEnd}:{allSeries:DataSeries[];effectiveStart:string;effectiveEnd:string}) {
+function YearlyRiskTable({allSeries,effectiveStart,effectiveEnd,showWinner}:{allSeries:DataSeries[];effectiveStart:string;effectiveEnd:string;showWinner:boolean}) {
   const bm=useMemo(()=>allSeries.find(s=>s.isBenchmark)??null,[allSeries])
   const yearlyData=useMemo(()=>allSeries.map(s=>{
     const years=computeYearlyRisk(s,bm,effectiveStart,effectiveEnd)
@@ -827,11 +956,23 @@ function YearlyRiskTable({allSeries,effectiveStart,effectiveEnd}:{allSeries:Data
             {metrics.map(metric=>(
               <React.Fragment key={metric.key as string}>
                 <tr className="bg-slate-800/50">
-                  <td colSpan={2+yearlyData.length} className="py-1.5 px-3 text-xs font-semibold text-slate-300 border border-slate-700">{metric.label}</td>
+                  <td colSpan={2+yearlyData.length} className="py-1.5 px-3 text-xs font-semibold text-slate-300 border border-slate-700">
+                    <HoverTooltip text={YEARLY_METRIC_EXPLAIN[metric.key as string]??metric.label}>{metric.label}</HoverTooltip>
+                  </td>
                 </tr>
-                {(['Átlag','Legjobb','Legrosszabb','Szórás (σ)'] as const).map(row=>(
+                {(['Átlag','Legjobb','Legrosszabb','Szórás (σ)'] as const).map(row=>{
+                  const rowHB=row==='Szórás (σ)'?false:metric.higherBetter
+                  const rowVals=yearlyData.map(d=>{
+                    if(metric.skip?.(d)) return null
+                    const s=d[metric.key] as Stat
+                    if(row==='Átlag') return s.avg
+                    if(row==='Legjobb') return metric.higherBetter?s.max:s.min
+                    if(row==='Legrosszabb') return metric.higherBetter?s.min:s.max
+                    return s.std
+                  })
+                  return (
                   <tr key={row}>
-                    <td className={L} colSpan={2}>{row}</td>
+                    <td className={L} colSpan={2}><HoverTooltip text={YEARLY_SUBROW_EXPLAIN[row]??row}>{row}</HoverTooltip></td>
                     {yearlyData.map(d=>{
                       const s=d[metric.key] as Stat
                       if(metric.skip?.(d)) return <td key={d.series.id} className={`${C} text-slate-600`}>—</td>
@@ -840,14 +981,16 @@ function YearlyRiskTable({allSeries,effectiveStart,effectiveEnd}:{allSeries:Data
                       else if(row==='Legjobb'){val=metric.higherBetter?s.max:s.min;yr=metric.higherBetter?s.maxYr:s.minYr;cls='text-emerald-400'}
                       else if(row==='Legrosszabb'){val=metric.higherBetter?s.min:s.max;yr=metric.higherBetter?s.minYr:s.maxYr;cls='text-red-400'}
                       else{val=s.std;cls='text-slate-400'}
+                      const wBg=showWinner?winnerBg(val,rowVals,rowHB):''
                       return (
-                        <td key={d.series.id} className={`${C} ${cls}`}>
+                        <td key={d.series.id} className={`${C} ${cls} ${wBg}`}>
                           {metric.fmt(val)}{yr?<span className="text-slate-600 ml-1 text-[10px]">{fyr(yr)}</span>:null}
                         </td>
                       )
                     })}
                   </tr>
-                ))}
+                  )
+                })}
               </React.Fragment>
             ))}
           </tbody>
@@ -958,9 +1101,23 @@ export default function Dashboard() {
   const bmSearchRef=useRef<HTMLDivElement>(null)
   const corrSearchRef=useRef<HTMLDivElement>(null)
   const [hiddenIds,setHiddenIds]=useState<string[]>([])
+  const [showWinner,setShowWinner]=useState(true)
+  const [codeInput,setCodeInput]=useState('')
+  const [codeError,setCodeError]=useState(false)
   const fetchGenRef=useRef(0)
 
   const toggleVisibility=(id:string)=>setHiddenIds(p=>p.includes(id)?p.filter(x=>x!==id):[...p,id])
+
+  const stateCode=useMemo(()=>encodeStateCode(period,dateRangeMode,metric,showWinner,selectedIds,selectedBmIds,correctionMap),[period,dateRangeMode,metric,showWinner,selectedIds,selectedBmIds,correctionMap])
+
+  function applyCode(raw:string){
+    const st=decodeStateCode(raw,funds)
+    if(!st){setCodeError(true);setTimeout(()=>setCodeError(false),2000);return}
+    setPeriod(st.period);setDateRangeMode(st.dateRangeMode);setMetric(st.metric)
+    setShowWinner(st.showWinner);setSelectedIds(st.selectedIds);setSelectedBmIds(st.selectedBmIds)
+    setCorrectionMap(st.correctionMap);setCorrectionSources(st.correctionSources)
+    setHiddenIds([]);setCodeInput('');setCodeError(false)
+  }
 
   useEffect(()=>{
     function h(e:MouseEvent){
@@ -1138,7 +1295,16 @@ export default function Dashboard() {
             <h1 className="text-2xl font-bold text-white">Alap Elemző</h1>
             <p className="text-slate-400 text-sm mt-0.5">Befektetési alap teljesítmény dashboard</p>
           </div>
-          <div className="text-right text-sm text-slate-500">{funds.length} adatsor · {selectedIds.length} alap + {selectedBmIds.length} benchmark</div>
+          <div className="flex flex-col items-end gap-2">
+            <div className="text-sm text-slate-500">{funds.length} adatsor · {selectedIds.length} alap + {selectedBmIds.length} benchmark</div>
+            <div className="flex items-center gap-2">
+              <button onClick={()=>{navigator.clipboard.writeText(stateCode)}} title={stateCode} className="font-mono text-[10px] text-slate-600 hover:text-slate-400 bg-slate-900 border border-slate-800 rounded px-2 py-1 max-w-[180px] truncate transition-colors">
+                {stateCode.slice(0,22)}…
+              </button>
+              <input value={codeInput} onChange={e=>{setCodeInput(e.target.value);setCodeError(false)}} onKeyDown={e=>e.key==='Enter'&&applyCode(codeInput)} placeholder="Kód betöltése…" className={`bg-slate-900 border rounded px-2 py-1 text-[11px] text-slate-300 placeholder-slate-700 font-mono w-36 focus:outline-none transition-colors ${codeError?'border-red-600 focus:border-red-500':'border-slate-800 focus:border-slate-600'}`}/>
+              <button onClick={()=>applyCode(codeInput)} className="text-xs px-2 py-1 bg-slate-800 text-slate-400 hover:text-white rounded transition-colors">▶</button>
+            </div>
+          </div>
         </div>
       </header>
 
@@ -1162,6 +1328,12 @@ export default function Dashboard() {
             </div>
           </div>
           {commonDateRange&&<div className="text-xs text-slate-600 mt-4">Közös: {fmtS(commonDateRange.start)} – {fmtS(commonDateRange.end)}</div>}
+          <div>
+            <div className="text-xs uppercase tracking-widest text-slate-600 mb-1">Győztes kiemelés</div>
+            <button onClick={()=>setShowWinner(v=>!v)} className={`px-4 py-1.5 rounded-lg text-sm font-medium border transition-all ${showWinner?'bg-emerald-900/50 border-emerald-700 text-emerald-300':'border-slate-700 text-slate-500 bg-slate-900 hover:text-slate-300'}`}>
+              {showWinner?'✓ Bekapcsolva':'Kikapcsolva'}
+            </button>
+          </div>
           <div className="ml-auto flex items-center gap-2 text-xs">
             {isLoading
               ? <><div className="w-1.5 h-1.5 rounded-full bg-blue-400 animate-pulse"/><span className="text-slate-500">Betöltés...</span></>
@@ -1286,30 +1458,30 @@ export default function Dashboard() {
         {mainMetrics.length>0&&(
           <section className="bg-slate-900 rounded-xl border border-slate-800 p-6">
             <h2 className="font-semibold text-white mb-1 flex items-center">Kockázat-hozam elemzés<InfoPanel text={INFO.riskreturn}/></h2>
-            <p className="text-xs text-slate-500 mb-5">Vigye az egérmutatót egy sor fölé a magyarázatért</p>
+            <p className="text-xs text-slate-500 mb-5">Vigye az egérmutatót az ⓘ ikon fölé a magyarázatért</p>
             <div className="overflow-x-auto">
-              <table className="w-full text-sm">
+              <table className="text-sm">
                 <thead>
                   <tr className="border-b border-slate-800">
-                    <th className="text-left py-3 pr-6 text-slate-500 font-medium w-44">Mutató</th>
-                    {mainMetrics.map(m=><th key={m.seriesId} className="text-right py-3 px-4 font-medium" style={{color:m.seriesColor}}>{m.isBenchmark?'⬡ ':''}{m.seriesName.split(' ').slice(0,3).join(' ')}</th>)}
+                    <th className="text-left py-3 pr-4 text-slate-500 font-medium w-36">Mutató</th>
+                    {mainMetrics.map(m=><th key={m.seriesId} className="text-right py-3 px-3 font-medium" style={{color:m.seriesColor}}>{m.isBenchmark?'⬡ ':''}{m.seriesName.split(' ').slice(0,3).join(' ')}</th>)}
                   </tr>
                 </thead>
                 <tbody>
                   <ExplainRow label="Alfa" explanation={EXPLAIN.alpha}>
-                    {mainMetrics.map(m=><td key={m.seriesId} className={`py-3 px-4 text-right font-mono font-medium ${m.isBenchmark||m.alpha==null?'text-slate-600':m.alpha>=0?'text-emerald-400':'text-red-400'}`}>{m.isBenchmark?'—':fmtPct(m.alpha)}</td>)}
+                    {mainMetrics.map(m=>{const wBg=showWinner&&!m.isBenchmark?winnerBg(m.alpha,mainMetrics.filter(x=>!x.isBenchmark).map(x=>x.alpha),true):'';return<td key={m.seriesId} className={`py-3 px-3 text-right font-mono font-medium ${m.isBenchmark||m.alpha==null?'text-slate-600':m.alpha>=0?'text-emerald-400':'text-red-400'} ${wBg}`}>{m.isBenchmark?'—':fmtPct(m.alpha)}</td>})}
                   </ExplainRow>
                   <ExplainRow label="Béta" explanation={EXPLAIN.beta}>
-                    {mainMetrics.map(m=><td key={m.seriesId} className={`py-3 px-4 text-right font-mono ${m.isBenchmark||m.beta==null?'text-slate-600':Math.abs((m.beta??1)-1)<0.2?'text-yellow-400':(m.beta??1)<1?'text-emerald-400':'text-red-400'}`}>{m.isBenchmark?'—':fmtNum(m.beta)}</td>)}
+                    {mainMetrics.map(m=>{const wBg=showWinner&&!m.isBenchmark?winnerBg(m.beta,mainMetrics.filter(x=>!x.isBenchmark).map(x=>x.beta),false):'';return<td key={m.seriesId} className={`py-3 px-3 text-right font-mono ${m.isBenchmark||m.beta==null?'text-slate-600':Math.abs((m.beta??1)-1)<0.2?'text-yellow-400':(m.beta??1)<1?'text-emerald-400':'text-red-400'} ${wBg}`}>{m.isBenchmark?'—':fmtNum(m.beta)}</td>})}
                   </ExplainRow>
                   <ExplainRow label="Sharpe-ráta" explanation={EXPLAIN.sharpe}>
-                    {mainMetrics.map(m=><td key={m.seriesId} className={`py-3 px-4 text-right font-mono ${m.sharpe==null?'text-slate-600':m.sharpe>=1?'text-emerald-400':m.sharpe>=0?'text-yellow-400':'text-red-400'}`}>{fmtNum(m.sharpe)}</td>)}
+                    {mainMetrics.map(m=>{const wBg=showWinner?winnerBg(m.sharpe,mainMetrics.map(x=>x.sharpe),true):'';return<td key={m.seriesId} className={`py-3 px-3 text-right font-mono ${m.sharpe==null?'text-slate-600':m.sharpe>=1?'text-emerald-400':m.sharpe>=0?'text-yellow-400':'text-red-400'} ${wBg}`}>{fmtNum(m.sharpe)}</td>})}
                   </ExplainRow>
                   <ExplainRow label="Szórás" explanation={EXPLAIN.stdDev}>
-                    {mainMetrics.map(m=><td key={m.seriesId} className={`py-3 px-4 text-right font-mono ${m.stdDev==null?'text-slate-600':m.stdDev<10?'text-emerald-400':m.stdDev<20?'text-yellow-400':'text-red-400'}`}>{fmtPct(m.stdDev)}</td>)}
+                    {mainMetrics.map(m=>{const wBg=showWinner?winnerBg(m.stdDev,mainMetrics.map(x=>x.stdDev),false):'';return<td key={m.seriesId} className={`py-3 px-3 text-right font-mono ${m.stdDev==null?'text-slate-600':m.stdDev<10?'text-emerald-400':m.stdDev<20?'text-yellow-400':'text-red-400'} ${wBg}`}>{fmtPct(m.stdDev)}</td>})}
                   </ExplainRow>
                   <ExplainRow label="Összesített score" explanation={EXPLAIN.score}>
-                    {mainMetrics.map(m=><td key={m.seriesId} className="py-4 px-4"><ScoreBar score={m.totalScore} color={m.seriesColor}/></td>)}
+                    {mainMetrics.map(m=>{const wBg=showWinner?winnerBg(m.totalScore,mainMetrics.map(x=>x.totalScore),true):'';return<td key={m.seriesId} className={`py-4 px-3 ${wBg}`}><ScoreBar score={m.totalScore} color={m.seriesColor}/></td>})}
                   </ExplainRow>
                 </tbody>
               </table>
@@ -1319,7 +1491,7 @@ export default function Dashboard() {
 
         {/* Rolling kockázati grafikon + éves tábla */}
         {visibleSeries.length>0&&<RollingRiskChart allSeries={visibleSeries} effectiveStart={effectiveStart} effectiveEnd={effectiveEnd}/>}
-        {visibleSeries.length>0&&<YearlyRiskTable allSeries={visibleSeries} effectiveStart={effectiveStart} effectiveEnd={effectiveEnd}/>}
+        {visibleSeries.length>0&&<YearlyRiskTable allSeries={visibleSeries} effectiveStart={effectiveStart} effectiveEnd={effectiveEnd} showWinner={showWinner}/>}
 
         {/* Időszak elemző */}
         {allDrawPeriods.length>0&&(
@@ -1358,13 +1530,13 @@ export default function Dashboard() {
                 })}
               </div>
               <div className="flex-1 min-w-0 border-l border-slate-800 pl-6">
-                {selectedPeriod?<PeriodDetail period={selectedPeriod} allSeries={visibleSeries}/>:<div className="text-slate-500 text-sm">Válassz egy időszakot a bal oldalon</div>}
+                {selectedPeriod?<PeriodDetail period={selectedPeriod} allSeries={visibleSeries} showWinner={showWinner}/>:<div className="text-slate-500 text-sm">Válassz egy időszakot a bal oldalon</div>}
               </div>
             </div>
           </section>
         )}
 
-        {allDrawPeriods.length>0&&visibleSeries.length>0&&<SummaryTable allPeriods={allDrawPeriods} allSeries={visibleSeries}/>}
+        {allDrawPeriods.length>0&&visibleSeries.length>0&&<SummaryTable allPeriods={allDrawPeriods} allSeries={visibleSeries} showWinner={showWinner}/>}
 
         {visibleSeries.length>0&&<QuarterlyHeatmap allSeries={visibleSeries} effectiveStart={effectiveStart} effectiveEnd={effectiveEnd}/>}
 
