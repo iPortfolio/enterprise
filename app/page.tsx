@@ -41,6 +41,8 @@ type Period = '1y' | '3y' | '5y' | 'all'
 type MainMetric = 'pct' | 'return_1y' | 'return_3y' | 'return_5y'
 type DateRangeMode = 'full' | 'common'
 type HeatMetric = 'score' | 'totalReturn' | 'stdDev' | 'sharpe' | 'alpha' | 'beta'
+type RollingMetric = 'vol' | 'ewma' | 'var' | 'es'
+type VolWindow = 30 | 90 | 252
 
 // ── Konstansok ────────────────────────────────────────────────────────────────
 
@@ -214,6 +216,125 @@ function detectDrawEvents(points: DataPoint[], type: 'drawdown' | 'drawup'): Dra
     start: points[e.startIdx].date, end: points[e.extremeIdx].date,
     magnitude: e.magnitude, durationDays: daysBetween(points[e.startIdx].date, points[e.extremeIdx].date),
   }))
+}
+
+// ── Éves kockázati elemzés ────────────────────────────────────────────────────
+
+interface YearlyRisk {
+  year:number; sharpe:number|null; sortino:number|null
+  maxDD:number|null; ddDays:number|null; recoveryDays:number|null; beta:number|null
+}
+
+function aggStats(values:(number|null)[],years:number[]) {
+  const valid=values.flatMap((v,i)=>v!=null?[{v:v,yr:years[i]}]:[])
+  if(!valid.length) return {avg:null,min:null,minYr:null,max:null,maxYr:null,std:null}
+  const minE=valid.reduce((a,b)=>a.v<=b.v?a:b)
+  const maxE=valid.reduce((a,b)=>a.v>=b.v?a:b)
+  const avg=valid.reduce((s,x)=>s+x.v,0)/valid.length
+  const std=valid.length>1?Math.sqrt(valid.reduce((s,x)=>s+(x.v-avg)**2,0)/valid.length):null
+  return {avg,min:minE.v,minYr:minE.yr,max:maxE.v,maxYr:maxE.yr,std}
+}
+
+function computeYearlyRisk(series:DataSeries,bm:DataSeries|null,start:string,end:string):YearlyRisk[]{
+  const pts=series.points.filter(p=>p.date>=start&&p.date<=end)
+  if(pts.length<10) return []
+  const byYear=new Map<number,DataPoint[]>()
+  pts.forEach(p=>{const yr=new Date(p.date).getFullYear();if(!byYear.has(yr))byYear.set(yr,[]);byYear.get(yr)!.push(p)})
+  return [...byYear.entries()].sort((a,b)=>a[0]-b[0]).flatMap(([yr,yPts])=>{
+    if(yPts.length<5) return []
+    const dailyR:number[]=[]
+    for(let i=1;i<yPts.length;i++) if(yPts[i-1].value>0) dailyR.push((yPts[i].value-yPts[i-1].value)/yPts[i-1].value)
+    if(dailyR.length<3) return []
+    const mean=dailyR.reduce((s,r)=>s+r,0)/dailyR.length
+    const variance=dailyR.reduce((s,r)=>s+(r-mean)**2,0)/dailyR.length
+    const stdDev=Math.sqrt(variance*252)*100
+    const annR=mean*252*100
+    const sharpe=stdDev>0?(annR-RISK_FREE)/stdDev:null
+    const negR=dailyR.filter(r=>r<0)
+    const sortino=negR.length>=2?(()=>{const dv=negR.reduce((s,r)=>s+r**2,0)/negR.length;const dd=Math.sqrt(dv*252)*100;return dd>0?(annR-RISK_FREE)/dd:null})():null
+    // Max DD + duration
+    let maxDD=0,hwm=yPts[0].value,hwmDate=yPts[0].date,troughDate=yPts[0].date,ddDays:number|null=null
+    yPts.forEach(p=>{
+      if(p.value>hwm){hwm=p.value;hwmDate=p.date}
+      const dd=(hwm-p.value)/hwm*100
+      if(dd>maxDD){maxDD=dd;troughDate=p.date;ddDays=daysBetween(hwmDate,p.date)}
+    })
+    // Recovery: look forward in full series
+    let recoveryDays:number|null=null
+    if(maxDD>1&&ddDays!=null){
+      const troughIdx=series.points.findIndex(p=>p.date===troughDate)
+      if(troughIdx>=0){
+        const hwmLevel=series.points.find(p=>p.date===hwmDate)?.value??hwm
+        const rec=series.points.slice(troughIdx+1).find(p=>p.value>=hwmLevel)
+        if(rec) recoveryDays=daysBetween(troughDate,rec.date)
+      }
+    }
+    // Beta
+    let beta:number|null=null
+    if(bm&&!series.isBenchmark){
+      const bmMap=new Map(bm.points.filter(p=>p.date>=yPts[0].date&&p.date<=yPts[yPts.length-1].date).map(p=>[p.date,p.value]))
+      const paired:{f:number;b:number}[]=[]
+      for(let i=1;i<yPts.length;i++){
+        const b0=bmMap.get(yPts[i-1].date),b1=bmMap.get(yPts[i].date)
+        if(b0&&b1&&b0>0&&yPts[i-1].value>0) paired.push({f:(yPts[i].value-yPts[i-1].value)/yPts[i-1].value,b:(b1-b0)/b0})
+      }
+      if(paired.length>=5){
+        const n=paired.length,bm_=paired.reduce((s,p)=>s+p.b,0)/n,fm=paired.reduce((s,p)=>s+p.f,0)/n
+        const cov=paired.reduce((s,p)=>s+(p.b-bm_)*(p.f-fm),0)/n,bv=paired.reduce((s,p)=>s+(p.b-bm_)**2,0)/n
+        if(bv>0) beta=cov/bv
+      }
+    }
+    return [{year:yr,sharpe,sortino,maxDD:maxDD>0?maxDD:null,ddDays,recoveryDays,beta}]
+  })
+}
+
+// Rolling risk computation
+function computeRollingVol(points:DataPoint[],window:number):Map<string,number>{
+  const result=new Map<string,number>()
+  for(let i=window;i<points.length;i++){
+    const slice=points.slice(i-window,i+1),returns:number[]=[]
+    for(let j=1;j<slice.length;j++) if(slice[j-1].value>0) returns.push((slice[j].value-slice[j-1].value)/slice[j-1].value)
+    if(returns.length<2) continue
+    const mean=returns.reduce((s,r)=>s+r,0)/returns.length
+    const variance=returns.reduce((s,r)=>s+(r-mean)**2,0)/returns.length
+    result.set(points[i].date,Math.sqrt(variance*252)*100)
+  }
+  return result
+}
+function computeEWMAVol(points:DataPoint[],lambda=0.94):Map<string,number>{
+  const result=new Map<string,number>();let ewmaVar:number|null=null
+  for(let i=1;i<points.length;i++){
+    if(points[i-1].value<=0) continue
+    const r=(points[i].value-points[i-1].value)/points[i-1].value
+    ewmaVar=ewmaVar===null?r*r:lambda*ewmaVar+(1-lambda)*r*r
+    result.set(points[i].date,Math.sqrt(ewmaVar*252)*100)
+  }
+  return result
+}
+function computeRollingVaR(points:DataPoint[],window=252,conf=0.95):Map<string,number>{
+  const result=new Map<string,number>(),returns:number[]=[]
+  for(let i=1;i<points.length;i++){
+    returns.push(points[i-1].value>0?(points[i].value-points[i-1].value)/points[i-1].value:0)
+    if(returns.length>=window){
+      const sorted=[...returns.slice(-window)].sort((a,b)=>a-b)
+      const idx=Math.max(0,Math.floor((1-conf)*sorted.length)-1)
+      result.set(points[i].date,-sorted[idx]*100)
+    }
+  }
+  return result
+}
+function computeRollingES(points:DataPoint[],window=252,conf=0.95):Map<string,number>{
+  const result=new Map<string,number>(),returns:number[]=[]
+  for(let i=1;i<points.length;i++){
+    returns.push(points[i-1].value>0?(points[i].value-points[i-1].value)/points[i-1].value:0)
+    if(returns.length>=window){
+      const sorted=[...returns.slice(-window)].sort((a,b)=>a-b)
+      const cutoff=Math.max(1,Math.floor((1-conf)*sorted.length))
+      const tail=sorted.slice(0,cutoff)
+      result.set(points[i].date,-tail.reduce((s,r)=>s+r,0)/tail.length*100)
+    }
+  }
+  return result
 }
 
 // ── Metrikák ─────────────────────────────────────────────────────────────────
@@ -549,10 +670,34 @@ function QuarterlyHeatmap({allSeries,effectiveStart,effectiveEnd}:{allSeries:Dat
     return fmtPct(val,1)
   }
 
+  // Quarterly price change per series per quarter
+  const qChanges=useMemo(()=>data.map(q=>({
+    quarter:q.quarter,
+    changes:allSeries.map(s=>{
+      const pts=s.points.filter(p=>p.date>=q.start&&p.date<=q.end)
+      if(pts.length<2||pts[0].value<=0) return null
+      return ((pts[pts.length-1].value-pts[0].value)/pts[0].value)*100
+    })
+  })),[data,allSeries])
+
+  const maxAbsQChange=useMemo(()=>{
+    let max=0
+    qChanges.forEach(q=>q.changes.forEach(v=>{if(v!=null&&Math.abs(v)>max)max=Math.abs(v)}))
+    return max||1
+  },[qChanges])
+
+  function getQChangeBg(val:number|null):string{
+    if(val==null) return 'transparent'
+    const direction=val>=0?'good' as const:'bad' as const
+    const intensity=colorMode==='absolute'?0.72:Math.min(Math.abs(val)/maxAbsQChange,1)
+    return cellBg(direction,intensity)
+  }
+
   if(!data.length) return null
 
   const CELL='py-1.5 px-3 text-center border border-slate-700 font-mono text-xs'
   const HEAD='py-2 px-3 border border-slate-700 font-medium text-xs bg-slate-900 whitespace-nowrap'
+  const LBORDER='border-l-2 border-l-slate-500'
 
   return (
     <div className="bg-slate-900 rounded-xl border border-slate-800 p-6">
@@ -574,31 +719,217 @@ function QuarterlyHeatmap({allSeries,effectiveStart,effectiveEnd}:{allSeries:Dat
       <div className="overflow-x-auto max-h-[600px] overflow-y-auto">
         <table className="text-xs border-collapse">
           <thead className="sticky top-0 z-10">
+            {/* Group header row */}
             <tr>
-              <th className={`${HEAD} text-left text-slate-500`}>Negyedév</th>
+              <th className={`${HEAD} text-left text-slate-500`} rowSpan={2}>Negyedév</th>
+              <th className={`${HEAD} text-center text-slate-400`} colSpan={allSeries.length}>{HEAT_LABELS[heatMetric]}</th>
+              <th className={`${HEAD} text-center text-slate-400 ${LBORDER}`} colSpan={allSeries.length}>Negyedéves Δ%</th>
+            </tr>
+            {/* Series name row */}
+            <tr>
               {allSeries.map(s=>(
-                <th key={s.id} className={`${HEAD} text-center`} style={{color:s.color}}>{s.shortName}</th>
+                <th key={`m-${s.id}`} className={`${HEAD} text-center`} style={{color:s.color}}>{s.shortName}</th>
+              ))}
+              {allSeries.map((s,i)=>(
+                <th key={`c-${s.id}`} className={`${HEAD} text-center ${i===0?LBORDER:''}`} style={{color:s.color}}>{s.shortName}</th>
               ))}
             </tr>
           </thead>
           <tbody>
-            {data.map(q=>(
+            {data.map((q,qi)=>{
+              const qc=qChanges[qi]
+              return (
               <tr key={q.quarter}>
                 <td className="py-1.5 px-3 text-slate-500 font-mono whitespace-nowrap border border-slate-700 text-xs">{q.quarter}</td>
+                {/* Metric columns */}
                 {q.metrics.map(m=>{
                   const isBmAlphaBeta=m.isBenchmark&&(heatMetric==='alpha'||heatMetric==='beta')
                   const bg=isBmAlphaBeta||m.isBenchmark?'transparent':getCellBg(m,q.metrics)
                   return (
-                    <td key={m.seriesId} className={CELL} style={{backgroundColor:bg}}>
+                    <td key={`m-${m.seriesId}`} className={CELL} style={{backgroundColor:bg}}>
                       <span className={isBmAlphaBeta?'text-slate-600':'text-slate-100'}>{isBmAlphaBeta?'—':fmtCell(m)}</span>
                     </td>
                   )
                 })}
+                {/* Quarterly change columns */}
+                {allSeries.map((s,i)=>{
+                  const val=qc.changes[i]
+                  const bg=s.isBenchmark?'transparent':getQChangeBg(val)
+                  return (
+                    <td key={`c-${s.id}`} className={`${CELL} ${i===0?LBORDER:''}`} style={{backgroundColor:bg}}>
+                      <span className={s.isBenchmark?'text-slate-400':'text-slate-100'}>{val==null?'—':fmtPct(val,2)}</span>
+                    </td>
+                  )
+                })}
               </tr>
+            )})}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  )
+}
+
+// ── Éves kockázati tábla ─────────────────────────────────────────────────────
+
+function YearlyRiskTable({allSeries,effectiveStart,effectiveEnd}:{allSeries:DataSeries[];effectiveStart:string;effectiveEnd:string}) {
+  const bm=useMemo(()=>allSeries.find(s=>s.isBenchmark)??null,[allSeries])
+  const yearlyData=useMemo(()=>allSeries.map(s=>{
+    const years=computeYearlyRisk(s,bm,effectiveStart,effectiveEnd)
+    const yrs=years.map(y=>y.year)
+    return {series:s,years,
+      sharpe:aggStats(years.map(y=>y.sharpe),yrs),
+      sortino:aggStats(years.map(y=>y.sortino),yrs),
+      maxDD:aggStats(years.map(y=>y.maxDD),yrs),
+      ddDays:aggStats(years.map(y=>y.ddDays),yrs),
+      recoveryDays:aggStats(years.map(y=>y.recoveryDays),yrs),
+      beta:aggStats(years.map(y=>y.beta),yrs),
+    }
+  }),[allSeries,bm,effectiveStart,effectiveEnd])
+
+  if(!yearlyData.some(d=>d.years.length>0)) return null
+
+  const H='py-1.5 px-3 text-xs font-medium border border-slate-700 bg-slate-900 whitespace-nowrap'
+  const C='py-1.5 px-3 text-xs font-mono border border-slate-700 text-center'
+  const L='py-1.5 px-3 text-xs border border-slate-700 text-slate-400 whitespace-nowrap'
+  const fv=(v:number|null,d=2)=>v==null?'—':v.toFixed(d)
+  const fyr=(yr:number|null)=>yr==null?'':` (${yr})`
+
+  type Stat={avg:number|null;min:number|null;minYr:number|null;max:number|null;maxYr:number|null;std:number|null}
+  type MetricCfg={
+    key:keyof typeof yearlyData[0]; label:string; higherBetter:boolean
+    fmt:(v:number|null)=>string; skip?:(s:typeof yearlyData[0])=>boolean
+  }
+  const metrics:MetricCfg[]=[
+    {key:'sharpe',label:'Sharpe-ráta',higherBetter:true,fmt:v=>fv(v)},
+    {key:'sortino',label:'Sortino-ráta',higherBetter:true,fmt:v=>fv(v)},
+    {key:'maxDD',label:'Max Drawdown',higherBetter:false,fmt:v=>v==null?'—':`-${v.toFixed(1)}%`},
+    {key:'ddDays',label:'DD Időtartam',higherBetter:false,fmt:v=>v==null?'—':fmtDuration(Math.round(v))},
+    {key:'recoveryDays',label:'Helyreállás',higherBetter:false,fmt:v=>v==null?'—':fmtDuration(Math.round(v))},
+    {key:'beta',label:'Béta',higherBetter:false,fmt:v=>fv(v,3),skip:s=>s.series.isBenchmark},
+  ]
+
+  return (
+    <div className="bg-slate-900 rounded-xl border border-slate-800 p-6">
+      <h2 className="font-semibold text-white mb-1">Éves kockázati statisztikák</h2>
+      <p className="text-xs text-slate-500 mb-4">Naptári évenkénti bontás — min / max / szórás az évek között · Sharpe &amp; Sortino: 6% kockázatmentes hozam</p>
+      <div className="overflow-x-auto">
+        <table className="text-xs border-collapse">
+          <thead>
+            <tr>
+              <th className={`${H} text-left text-slate-500`} colSpan={2}>Mutató</th>
+              {yearlyData.map(d=>(
+                <th key={d.series.id} className={`${H} text-center`} style={{color:d.series.color}}>{d.series.shortName}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {metrics.map(metric=>(
+              <React.Fragment key={metric.key as string}>
+                <tr className="bg-slate-800/50">
+                  <td colSpan={2+yearlyData.length} className="py-1.5 px-3 text-xs font-semibold text-slate-300 border border-slate-700">{metric.label}</td>
+                </tr>
+                {(['Átlag','Legjobb','Legrosszabb','Szórás (σ)'] as const).map(row=>(
+                  <tr key={row}>
+                    <td className={L} colSpan={2}>{row}</td>
+                    {yearlyData.map(d=>{
+                      const s=d[metric.key] as Stat
+                      if(metric.skip?.(d)) return <td key={d.series.id} className={`${C} text-slate-600`}>—</td>
+                      let val:number|null=null,yr:number|null=null,cls='text-slate-200'
+                      if(row==='Átlag'){val=s.avg}
+                      else if(row==='Legjobb'){val=metric.higherBetter?s.max:s.min;yr=metric.higherBetter?s.maxYr:s.minYr;cls='text-emerald-400'}
+                      else if(row==='Legrosszabb'){val=metric.higherBetter?s.min:s.max;yr=metric.higherBetter?s.minYr:s.maxYr;cls='text-red-400'}
+                      else{val=s.std;cls='text-slate-400'}
+                      return (
+                        <td key={d.series.id} className={`${C} ${cls}`}>
+                          {metric.fmt(val)}{yr?<span className="text-slate-600 ml-1 text-[10px]">{fyr(yr)}</span>:null}
+                        </td>
+                      )
+                    })}
+                  </tr>
+                ))}
+              </React.Fragment>
             ))}
           </tbody>
         </table>
       </div>
+    </div>
+  )
+}
+
+// ── Rolling kockázati grafikon ────────────────────────────────────────────────
+
+function RollingRiskChart({allSeries,effectiveStart,effectiveEnd}:{allSeries:DataSeries[];effectiveStart:string;effectiveEnd:string}) {
+  const [riskMetric,setRiskMetric]=useState<RollingMetric>('vol')
+  const [volWindow,setVolWindow]=useState<VolWindow>(90)
+
+  const METRIC_LABELS:Record<RollingMetric,string>={
+    vol:'Rolling volatilitás',ewma:'EWMA volatilitás',var:'VaR 95%',es:'Expected Shortfall (CVaR 95%)'
+  }
+
+  const chartData=useMemo(()=>{
+    const maps=allSeries.map(s=>{
+      const pts=s.points.filter(p=>p.date>=effectiveStart&&p.date<=effectiveEnd)
+      let map:Map<string,number>
+      if(riskMetric==='vol') map=computeRollingVol(pts,volWindow)
+      else if(riskMetric==='ewma') map=computeEWMAVol(pts)
+      else if(riskMetric==='var') map=computeRollingVaR(pts)
+      else map=computeRollingES(pts)
+      return {s,map}
+    })
+    const allDates=new Set<string>()
+    maps.forEach(({map})=>map.forEach((_,d)=>allDates.add(d)))
+    return [...allDates].sort().map(date=>{
+      const row:Record<string,number|string>={date}
+      maps.forEach(({s,map})=>{const v=map.get(date);if(v!=null)row[s.shortName]=v})
+      return row
+    })
+  },[allSeries,effectiveStart,effectiveEnd,riskMetric,volWindow])
+
+  const ticks=useMemo(()=>{
+    if(chartData.length<2) return []
+    const step=Math.max(1,Math.floor(chartData.length/8))
+    return chartData.filter((_,i)=>i%step===0||i===chartData.length-1).map(d=>d.date as string)
+  },[chartData])
+
+  if(!chartData.length) return null
+
+  return (
+    <div className="bg-slate-900 rounded-xl border border-slate-800 p-6">
+      <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+        <h2 className="font-semibold text-white">Kockázati mutatók — idősor</h2>
+        <div className="flex items-center gap-2 flex-wrap">
+          {riskMetric==='vol'&&(
+            <div className="flex bg-slate-800 rounded-lg p-0.5 gap-0.5">
+              {([30,90,252] as VolWindow[]).map(w=>(
+                <button key={w} onClick={()=>setVolWindow(w)} className={`px-3 py-1.5 rounded-md text-xs font-medium transition-all ${volWindow===w?'bg-slate-600 text-white':'text-slate-400 hover:text-slate-200'}`}>{w===30?'30n':w===90?'90n':'1é'}</button>
+              ))}
+            </div>
+          )}
+          <div className="flex bg-slate-800 rounded-lg p-0.5 gap-0.5">
+            {(['vol','ewma','var','es'] as RollingMetric[]).map(m=>(
+              <button key={m} onClick={()=>setRiskMetric(m)} className={`px-3 py-1.5 rounded-md text-xs font-medium transition-all ${riskMetric===m?'bg-slate-600 text-white':'text-slate-400 hover:text-slate-200'}`}>
+                {m==='vol'?'Rolling vol':m==='ewma'?'EWMA vol':m==='var'?'VaR':'CVaR'}
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
+      <p className="text-xs text-slate-500 mb-4">
+        {METRIC_LABELS[riskMetric]}
+        {riskMetric==='vol'?` · ${volWindow} napos ablak`:riskMetric==='var'||riskMetric==='es'?' · 252 napos ablak · 95% konfidencia':''}
+        {' · évesített %'}
+      </p>
+      <ResponsiveContainer width="100%" height={380}>
+        <LineChart data={chartData} margin={{top:5,right:20,left:10,bottom:5}}>
+          <CartesianGrid strokeDasharray="3 3" stroke="#1e293b"/>
+          <XAxis dataKey="date" ticks={ticks} tickFormatter={(d:any)=>fmtS(String(d))} tick={{fill:'#64748b',fontSize:11}} tickLine={false} axisLine={{stroke:'#1e293b'}}/>
+          <YAxis tick={{fill:'#64748b',fontSize:11}} tickLine={false} axisLine={false} tickFormatter={(v:any)=>`${Number(v).toFixed(1)}%`}/>
+          <Tooltip contentStyle={{backgroundColor:'#0f172a',border:'1px solid #1e293b',borderRadius:'8px',fontSize:'12px'}} labelFormatter={(l:any)=>fmt(String(l))} formatter={(v:any,n:any)=>[`${Number(v).toFixed(2)}%`,n]}/>
+          <Legend wrapperStyle={{fontSize:'12px',paddingTop:'12px'}}/>
+          {allSeries.map(s=><Line key={s.id} type="monotone" dataKey={s.shortName} stroke={s.color} strokeWidth={s.isBenchmark?1.5:2} strokeDasharray={s.isBenchmark?'5 3':undefined} dot={false} connectNulls/>)}
+        </LineChart>
+      </ResponsiveContainer>
     </div>
   )
 }
@@ -626,7 +957,10 @@ export default function Dashboard() {
   const searchRef=useRef<HTMLDivElement>(null)
   const bmSearchRef=useRef<HTMLDivElement>(null)
   const corrSearchRef=useRef<HTMLDivElement>(null)
+  const [hiddenIds,setHiddenIds]=useState<string[]>([])
   const fetchGenRef=useRef(0)
+
+  const toggleVisibility=(id:string)=>setHiddenIds(p=>p.includes(id)?p.filter(x=>x!==id):[...p,id])
 
   useEffect(()=>{
     function h(e:MouseEvent){
@@ -640,13 +974,7 @@ export default function Dashboard() {
 
   useEffect(()=>{
     supabase.from('funds').select('id,name,fund_manager,risk_return_indicator,std_dev_1y,std_dev_5y,is_benchmark').order('name')
-      .then(({data})=>{
-        if(data){
-          setFunds(data)
-          setSelectedIds(data.filter((f:Fund)=>!f.is_benchmark).slice(0,2).map((f:Fund)=>f.id))
-          setSelectedBmIds(data.filter((f:Fund)=>f.is_benchmark).map((f:Fund)=>f.id))
-        }
-      })
+      .then(({data})=>{if(data) setFunds(data)})
   },[])
 
   async function fetchAllRows(fundId:string,from:string):Promise<PriceRow[]>{
@@ -711,6 +1039,8 @@ export default function Dashboard() {
     })
   },[selectedIds,selectedBmIds,funds,prices,fundColorMap,correctionMap])
 
+  const visibleSeries=useMemo(()=>allSeries.filter(s=>!hiddenIds.includes(s.id)),[allSeries,hiddenIds])
+
   const commonDateRange=useMemo(()=>{
     const a=allSeries.filter(s=>s.points.length>0)
     if(!a.length) return null
@@ -724,26 +1054,30 @@ export default function Dashboard() {
 
   const chartData=useMemo(()=>{
     const rrMaps=new Map<string,Map<string,number>>()
-    if(metric!=='pct') allSeries.forEach(s=>rrMaps.set(s.id,rollingReturnMap(s.points,ROLLING_DAYS[metric])))
+    if(metric!=='pct') visibleSeries.forEach(s=>rrMaps.set(s.id,rollingReturnMap(s.points,ROLLING_DAYS[metric])))
+    // Base = first point within the displayed range for each series (guarantees 0% at start)
     const bases:Record<string,number>={}
-    allSeries.forEach(s=>{const fp=s.points.find(p=>p.date>=effectiveStart);if(fp)bases[s.shortName]=fp.value})
+    visibleSeries.forEach(s=>{
+      const fp=s.points.find(p=>p.date>=effectiveStart&&p.date<=effectiveEnd)
+      if(fp) bases[s.shortName]=fp.value
+    })
     const map:Record<string,Record<string,number>>={}
-    allSeries.forEach(s=>{
+    visibleSeries.forEach(s=>{
       s.points.filter(p=>p.date>=effectiveStart&&p.date<=effectiveEnd).forEach(p=>{
         if(!map[p.date])map[p.date]={}
-        if(metric==='pct'){if(bases[s.shortName])map[p.date][s.shortName]=((p.value-bases[s.shortName])/bases[s.shortName])*100}
+        if(metric==='pct'){const b=bases[s.shortName];if(b)map[p.date][s.shortName]=((p.value-b)/b)*100}
         else if(s.isBenchmark){const v=rrMaps.get(s.id)?.get(p.date);if(v!=null)map[p.date][s.shortName]=v}
         else{const pr=prices[s.id]?.find(r=>r.date===p.date);const v=pr?.[metric as 'return_1y'|'return_3y'|'return_5y'];if(v!=null)map[p.date][s.shortName]=Number(v)}
       })
     })
     return Object.entries(map).sort(([a],[b])=>a.localeCompare(b)).map(([date,vals])=>({date,...vals}))
-  },[allSeries,metric,prices,effectiveStart,effectiveEnd])
+  },[visibleSeries,metric,prices,effectiveStart,effectiveEnd])
 
   const chartTicks=useMemo(()=>getChartTicks(chartData,period),[chartData,period])
 
   const allDrawPeriods:DrawPeriod[]=useMemo(()=>{
     const result:DrawPeriod[]=[]
-    allSeries.forEach(s=>{
+    visibleSeries.forEach(s=>{
       const pts=s.points.filter(p=>p.date>=effectiveStart)
       ;(['drawdown','drawup'] as const).forEach(type=>{
         detectDrawEvents(pts,type).forEach((e,i)=>{
@@ -752,10 +1086,10 @@ export default function Dashboard() {
       })
     })
     return result
-  },[allSeries,effectiveStart])
+  },[visibleSeries,effectiveStart])
 
   const selectedPeriod=allDrawPeriods.find(p=>p.id===selectedPeriodId)??allDrawPeriods[0]??null
-  const mainMetrics=useMemo(()=>allSeries.length?computeAllMetrics(allSeries,effectiveStart,effectiveEnd):[],[allSeries,effectiveStart,effectiveEnd])
+  const mainMetrics=useMemo(()=>visibleSeries.length?computeAllMetrics(visibleSeries,effectiveStart,effectiveEnd):[],[visibleSeries,effectiveStart,effectiveEnd])
 
   const usedIds=new Set([...selectedIds,...selectedBmIds])
   const searchResults=funds.filter(f=>!usedIds.has(f.id)&&f.name.toLowerCase().includes(searchQuery.toLowerCase()))
@@ -766,11 +1100,13 @@ export default function Dashboard() {
   const addBm=(id:string)=>{setSelectedBmIds(p=>[...p,id]);setBmSearchQuery('');setBmSearchOpen(false)}
   const removeFund=(id:string)=>{
     setSelectedIds(p=>p.filter(x=>x!==id))
+    setHiddenIds(p=>p.filter(x=>x!==id))
     setPrices(p=>{const n={...p};delete n[id];return n})
     setCorrectionMap(p=>{const n={...p};delete n[id];Object.keys(n).forEach(k=>{if(n[k]===id)delete n[k]});return n})
   }
   const removeBm=(id:string)=>{
     setSelectedBmIds(p=>p.filter(x=>x!==id))
+    setHiddenIds(p=>p.filter(x=>x!==id))
     setPrices(p=>{const n={...p};delete n[id];return n})
     setCorrectionMap(p=>{const n={...p};Object.keys(n).forEach(k=>{if(n[k]===id)delete n[k]});return n})
   }
@@ -781,10 +1117,18 @@ export default function Dashboard() {
     setCorrectionMap(p=>{const n={...p};Object.keys(n).forEach(k=>{if(n[k]===id)delete n[k]});return n})
   }
 
-  const fundChips=[
-    ...selectedBmIds.map(id=>({fund:funds.find(f=>f.id===id),isBm:true})).filter((x):x is {fund:Fund,isBm:boolean}=>!!x.fund),
-    ...selectedIds.map(id=>({fund:funds.find(f=>f.id===id),isBm:false})).filter((x):x is {fund:Fund,isBm:boolean}=>!!x.fund),
-  ]
+  const EyeOn=()=><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+  const EyeOff=()=><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>
+  const Chip=({id,label,onRemove}:{id:string;label:string;onRemove:()=>void})=>{
+    const hidden=hiddenIds.includes(id)
+    return (
+      <div className={`flex items-center rounded-lg text-sm font-medium text-white overflow-hidden transition-opacity ${hidden?'opacity-40':''}`} style={{backgroundColor:fundColorMap[id]}}>
+        <span className="px-3 py-2 select-none">{label}</span>
+        <button onClick={()=>toggleVisibility(id)} className="px-1.5 py-2 hover:bg-black/20 transition-colors text-white/60 hover:text-white" title={hidden?'Megjelenítés':'Elrejtés'}>{hidden?<EyeOff/>:<EyeOn/>}</button>
+        <button onClick={onRemove} className="px-2 py-2 hover:bg-black/20 transition-colors text-white/70 hover:text-white">×</button>
+      </div>
+    )
+  }
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100">
@@ -833,13 +1177,9 @@ export default function Dashboard() {
           {/* Chipek + keresők */}
           <div>
             <div className="text-xs uppercase tracking-widest text-slate-500 font-semibold mb-2">Adatsorok</div>
-            <div className="flex flex-wrap gap-2">
-              {fundChips.map(({fund,isBm})=>(
-                <div key={fund.id} className="flex items-center rounded-lg text-sm font-medium text-white overflow-hidden" style={{backgroundColor:fundColorMap[fund.id]}}>
-                  <span className="px-3 py-2 select-none">{isBm?'⬡ ':''}{fund.name.split(' ').slice(0,4).join(' ')}</span>
-                  <button onClick={()=>isBm?removeBm(fund.id):removeFund(fund.id)} className="px-2 py-2 hover:bg-black/20 transition-colors text-white/70 hover:text-white">×</button>
-                </div>
-              ))}
+            <div className="flex flex-wrap gap-2 items-center">
+              {/* Alap chipek */}
+              {selectedIds.map(id=>{const f=funds.find(x=>x.id===id);return f?<Chip key={id} id={id} label={f.name.split(' ').slice(0,4).join(' ')} onRemove={()=>removeFund(id)}/>:null})}
 
               {/* + Alap */}
               <div ref={searchRef} className="relative">
@@ -854,6 +1194,9 @@ export default function Dashboard() {
                   </div>
                 )}
               </div>
+
+              {/* Benchmark chipek */}
+              {selectedBmIds.map(id=>{const f=funds.find(x=>x.id===id);return f?<Chip key={id} id={id} label={`⬡ ${f.name.split(' ').slice(0,4).join(' ')}`} onRemove={()=>removeBm(id)}/>:null})}
 
               {/* + Benchmark */}
               <div ref={bmSearchRef} className="relative">
@@ -933,7 +1276,7 @@ export default function Dashboard() {
                 <YAxis tick={{fill:'#64748b',fontSize:11}} tickLine={false} axisLine={false} tickFormatter={(v:any)=>`${Number(v).toFixed(0)}%`}/>
                 <Tooltip contentStyle={{backgroundColor:'#0f172a',border:'1px solid #1e293b',borderRadius:'8px',fontSize:'12px'}} labelStyle={{color:'#94a3b8',marginBottom:4}} labelFormatter={(l:any)=>fmtS(String(l))} formatter={(v:any,n:any)=>[`${Number(v).toFixed(2)}%`,n]}/>
                 <Legend wrapperStyle={{fontSize:'12px',paddingTop:'16px'}}/>
-                {allSeries.map(s=><Line key={s.id} type="monotone" dataKey={s.shortName} stroke={s.color} strokeWidth={s.isBenchmark?1.5:2} strokeDasharray={s.isBenchmark?'5 3':undefined} dot={false} connectNulls/>)}
+                {visibleSeries.map(s=><Line key={s.id} type="monotone" dataKey={s.shortName} stroke={s.color} strokeWidth={s.isBenchmark?1.5:2} strokeDasharray={s.isBenchmark?'5 3':undefined} dot={false} connectNulls/>)}
               </LineChart>
             </ResponsiveContainer>
           ):<div className="h-72 flex items-center justify-center text-slate-500">Válassz ki legalább egy adatsort</div>}
@@ -974,6 +1317,10 @@ export default function Dashboard() {
           </section>
         )}
 
+        {/* Rolling kockázati grafikon + éves tábla */}
+        {visibleSeries.length>0&&<RollingRiskChart allSeries={visibleSeries} effectiveStart={effectiveStart} effectiveEnd={effectiveEnd}/>}
+        {visibleSeries.length>0&&<YearlyRiskTable allSeries={visibleSeries} effectiveStart={effectiveStart} effectiveEnd={effectiveEnd}/>}
+
         {/* Időszak elemző */}
         {allDrawPeriods.length>0&&(
           <section className="bg-slate-900 rounded-xl border border-slate-800 p-6">
@@ -981,7 +1328,7 @@ export default function Dashboard() {
             <p className="text-xs text-slate-500 mb-5">{allDrawPeriods.length} azonosított időszak · Kattints egyre az összehasonlításhoz</p>
             <div className="flex gap-6">
               <div className="w-60 shrink-0 space-y-5 overflow-y-auto max-h-[600px]">
-                {allSeries.map(s=>{
+                {visibleSeries.map(s=>{
                   const periods=allDrawPeriods.filter(p=>p.seriesId===s.id)
                   if(!periods.length) return null
                   return (
@@ -1011,15 +1358,15 @@ export default function Dashboard() {
                 })}
               </div>
               <div className="flex-1 min-w-0 border-l border-slate-800 pl-6">
-                {selectedPeriod?<PeriodDetail period={selectedPeriod} allSeries={allSeries}/>:<div className="text-slate-500 text-sm">Válassz egy időszakot a bal oldalon</div>}
+                {selectedPeriod?<PeriodDetail period={selectedPeriod} allSeries={visibleSeries}/>:<div className="text-slate-500 text-sm">Válassz egy időszakot a bal oldalon</div>}
               </div>
             </div>
           </section>
         )}
 
-        {allDrawPeriods.length>0&&allSeries.length>0&&<SummaryTable allPeriods={allDrawPeriods} allSeries={allSeries}/>}
+        {allDrawPeriods.length>0&&visibleSeries.length>0&&<SummaryTable allPeriods={allDrawPeriods} allSeries={visibleSeries}/>}
 
-        {allSeries.length>0&&<QuarterlyHeatmap allSeries={allSeries} effectiveStart={effectiveStart} effectiveEnd={effectiveEnd}/>}
+        {visibleSeries.length>0&&<QuarterlyHeatmap allSeries={visibleSeries} effectiveStart={effectiveStart} effectiveEnd={effectiveEnd}/>}
 
       </main>
     </div>
